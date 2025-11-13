@@ -1,31 +1,24 @@
-"""
-voice_chat_vi_final.py
-
-GUI fullscreen giống mẫu bạn gửi, tích hợp:
-- Giữ chức năng "học" (lưu hội thoại vào SQLite và lưu thông tin người khi nhận diện).
-- Nếu có camera: tự động bật camera khi khởi động và hiển thị video ở giữa; avatar AI sẽ được đẩy lên góc phải trên.
-- Nếu không có camera: avatar hiển thị ở giữa như giao diện mẫu.
-- Khi phát hiện khuôn mặt mới: hỏi tên người (dialog) và lưu encoding để lần sau chào tự động.
-- Tích hợp TTS (pyttsx3) để trả lời bằng giọng nói.
-
-Yêu cầu cài đặt trước khi chạy (nếu muốn camera/nhận diện):
-- pip install Pillow pyttsx3 sounddevice vosk opencv-python face_recognition numpy
-  (face_recognition/dlib có thể cần thêm build tools; nếu không muốn, app vẫn chạy không camera)
-
-Chạy: python voice_chat_vi_final.py
-"""
+# voice_camera_app.py
+# Alex 2.0 — Fullscreen voice+camera assistant (Python 3.13 compatible)
+# - GUI fullscreen, avatar dynamic (drawn), camera auto-start if available
+# - face_recognition optional: ask name for new faces and greet on return
+# - SQLite stores conversations and face encodings
+# - TTS via pyttsx3, tries to select a VN male voice (young) if available
 
 import os
-import queue
-import threading
-import json
-import sqlite3
+import sys
 import time
-import math
+import threading
+import queue
+import sqlite3
+import json
+from math import sin, pi
 from difflib import SequenceMatcher
-from tkinter import Tk, Label, Button, Text, END, Canvas, NW
-from tkinter import simpledialog, messagebox
-from PIL import Image, ImageTk, ImageFilter
+
+# GUI
+from tkinter import Tk, Canvas, Text, END, simpledialog, messagebox
+from tkinter import NW
+from PIL import Image, ImageTk, ImageDraw, ImageFilter
 
 # Optional libs
 try:
@@ -49,249 +42,341 @@ except Exception:
     pyttsx3 = None
     TTS_AVAILABLE = False
 
-# ========== CONFIG & DB ==========
-DB_PATH = 'conversation.db'
+try:
+    import numpy as np
+except Exception:
+    np = None
+
+# ========== DB setup ==========
+DB_PATH = "voice_camera_data.db"
 conn = sqlite3.connect(DB_PATH, check_same_thread=False)
 cur = conn.cursor()
-cur.execute('''CREATE TABLE IF NOT EXISTS conv (id INTEGER PRIMARY KEY AUTOINCREMENT, role TEXT, text TEXT, ts REAL)''')
-cur.execute('''CREATE TABLE IF NOT EXISTS people (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, encoding BLOB)''')
-cur.execute('''CREATE TABLE IF NOT EXISTS images (id INTEGER PRIMARY KEY AUTOINCREMENT, embedding BLOB, label TEXT)''')
+cur.execute("""CREATE TABLE IF NOT EXISTS conv (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, role TEXT, text TEXT, ts REAL
+)""")
+cur.execute("""CREATE TABLE IF NOT EXISTS people (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, encoding BLOB
+)""")
 conn.commit()
 
-# helper functions
-def save_message(role, text, connection=conn):
-    c = connection.cursor()
-    c.execute("INSERT INTO conv (role,text,ts) VALUES (?,?,?)", (role, text, time.time()))
-    connection.commit()
-
-# simple conversation reply (can be replaced with smarter model later)
-def generate_reply(user_text):
-    # save and simple echo fallback
-    save_message('user', user_text)
-    # here we could check DB for similar
-    fallback = f"Mình nghe bạn nói: '{user_text}'. Bạn có thể nói thêm chi tiết được không?"
-    save_message('assistant', fallback)
-    return fallback
-
-# TTS
-def speak(text):
-    save_message('assistant', text)
-    if TTS_AVAILABLE:
-        try:
-            engine = pyttsx3.init()
-            engine.setProperty('rate', 150)
-            engine.say(text)
-            engine.runAndWait()
-            return
-        except Exception as e:
-            print('TTS error:', e)
-    print('Assistant (no TTS):', text)
-
-# face DB utilities
-import numpy as np
-
-def load_known_faces():
-    c = conn.cursor()
-    c.execute('SELECT id,name,encoding FROM people')
-    res = []
-    for _id, name, enc_blob in c.fetchall():
-        try:
-            enc = np.frombuffer(enc_blob, dtype=np.float64)
-            res.append((_id, name, enc))
-        except Exception:
-            continue
-    return res
-
-def save_new_face(name, encoding):
-    c = conn.cursor()
-    c.execute('INSERT INTO people (name, encoding) VALUES (?,?)', (name, encoding.tobytes()))
+def save_message(role, text):
+    cur = conn.cursor()
+    cur.execute("INSERT INTO conv (role, text, ts) VALUES (?,?,?)", (role, text, time.time()))
     conn.commit()
 
-def find_matching_face(face_encoding, known, tolerance=0.6):
-    best_name = None
-    best_dist = None
-    for _id, name, enc in known:
-        d = np.linalg.norm(enc - face_encoding)
-        if best_dist is None or d < best_dist:
-            best_dist = d
-            best_name = name
-    if best_dist is not None and best_dist < tolerance:
-        return best_name
+# ========== TTS engine (reuse) ==========
+_TTS_ENGINE = None
+
+def select_vietnamese_male_engine(engine):
+    # try to pick voice with Vietnamese locale or description; prefer male-ish voices
+    try:
+        voices = engine.getProperty("voices")
+    except Exception:
+        return None
+    def is_vi(v):
+        s = (str(getattr(v, "name", "")).lower() + " " + str(getattr(v, "id", "")).lower())
+        return ("vietnam" in s) or ("vi_" in s) or ("vietnamese" in s) or ("vi-" in s) or ("tiếng việt" in s) or ("vi " in s)
+    # 1) vi + male
+    for v in voices:
+        try:
+            meta = (str(getattr(v, "name","")) + " " + str(getattr(v,"id",""))).lower()
+            if is_vi(v) and ("male" in meta or "man" in meta or "m-" in meta):
+                return v.id
+        except Exception:
+            continue
+    # 2) vi any
+    for v in voices:
+        try:
+            if is_vi(v):
+                return v.id
+        except Exception:
+            continue
+    # 3) male any
+    for v in voices:
+        try:
+            meta = (str(getattr(v, "name","")) + " " + str(getattr(v,"id",""))).lower()
+            if ("male" in meta or "man" in meta or "m-" in meta):
+                return v.id
+        except Exception:
+            continue
     return None
 
-# ========== GUI class ==========
-class VoiceCameraApp:
+def speak(text, block=True):
+    """Speak text; reuse engine. block=True will run runAndWait() and block until done."""
+    save_message('assistant', text)
+    global _TTS_ENGINE
+    if not TTS_AVAILABLE:
+        print("TTS not available:", text)
+        return
+    try:
+        if _TTS_ENGINE is None:
+            _TTS_ENGINE = pyttsx3.init()
+            vid = select_vietnamese_male_engine(_TTS_ENGINE)
+            if vid:
+                try:
+                    _TTS_ENGINE.setProperty("voice", vid)
+                except Exception:
+                    pass
+            try:
+                _TTS_ENGINE.setProperty("rate", 150)
+            except Exception:
+                pass
+        if block:
+            _TTS_ENGINE.say(text)
+            _TTS_ENGINE.runAndWait()
+        else:
+            # non-blocking: run in a dedicated thread to avoid UI blocking
+            def _tb(t):
+                try:
+                    _TTS_ENGINE.say(t)
+                    _TTS_ENGINE.runAndWait()
+                except Exception as e:
+                    print("TTS thread error:", e)
+            threading.Thread(target=_tb, args=(text,), daemon=True).start()
+    except Exception as e:
+        print("TTS engine error:", e)
+        print(text)
+
+# ========== Face utilities ==========
+def load_known_faces():
+    cur = conn.cursor()
+    cur.execute("SELECT id, name, encoding FROM people")
+    rows = cur.fetchall()
+    result = []
+    for _id, name, enc_blob in rows:
+        try:
+            enc = np.frombuffer(enc_blob, dtype=np.float64)
+            result.append((_id, name, enc))
+        except Exception:
+            continue
+    return result
+
+def save_new_face(name, encoding):
+    cur = conn.cursor()
+    cur.execute("INSERT INTO people (name, encoding) VALUES (?,?)", (name, encoding.tobytes()))
+    conn.commit()
+
+def find_match(encoding, known, tol=0.6):
+    best = None
+    best_d = None
+    for _id, name, enc in known:
+        d = np.linalg.norm(enc - encoding)
+        if best_d is None or d < best_d:
+            best_d = d
+            best = name
+    if best_d is not None and best_d < tol:
+        return best
+    return None
+
+# ========== Avatar animation (drawn, no external file) ==========
+def make_avatar_image(size=600, face_color=(64,130,255)):
+    """Return PIL Image of a simple friendly male avatar (stylized)"""
+    im = Image.new("RGBA", (size, size), (255,255,255,0))
+    draw = ImageDraw.Draw(im)
+    w = size
+    # background circle
+    draw.ellipse((0,0,w,w), fill=(240,248,255,255))
+    # head
+    cx = w//2; cy = w//2 - int(w*0.05)
+    r = int(w*0.28)
+    draw.ellipse((cx-r, cy-r, cx+r, cy+r), fill=(245,220,200))
+    # hair (simple shape)
+    draw.polygon([(cx-r*0.8, cy-r*0.7),(cx+r*0.8, cy-r*0.9),(cx+r*0.3, cy-r*0.6),(cx-r*0.3, cy-r*0.6)], fill=(30,30,30))
+    # eyes
+    eye_w = int(r*0.25)
+    draw.ellipse((cx-eye_w, cy-int(r*0.05), cx-eye_w//2, cy+eye_w//3), fill=(0,0,0))
+    draw.ellipse((cx+eye_w//2, cy-int(r*0.05), cx+eye_w, cy+eye_w//3), fill=(0,0,0))
+    # smile
+    draw.arc((cx-int(r*0.6), cy+int(r*0.05), cx+int(r*0.6), cy+int(r*0.6)), start=200, end=340, fill=(150,30,30), width=6)
+    # shirt
+    draw.rectangle((cx-int(r*1.1), cy+int(r*0.6), cx+int(r*1.1), w), fill=(70,130,180))
+    return im
+
+# ========== App (Tkinter) ==========
+class AssistantApp:
     def __init__(self, root):
         self.root = root
-        self.root.title('Trợ lý AI — Fullscreen')
-        # fullscreen
-        self.root.attributes('-fullscreen', True)
-        self.width = self.root.winfo_screenwidth()
-        self.height = self.root.winfo_screenheight()
+        self.root.title("Alex — Trợ lý AI tiếng Việt")
+        self.root.attributes("-fullscreen", True)
+        self.w = self.root.winfo_screenwidth()
+        self.h = self.root.winfo_screenheight()
+        self.bg = "#f7fbff"
+        self.root.configure(bg=self.bg)
 
-        self.bg_color = '#fbfbfc'
-        self.root.configure(bg=self.bg_color)
+        self.canvas = Canvas(root, width=self.w, height=self.h, bg=self.bg, highlightthickness=0)
+        self.canvas.pack(fill="both", expand=True)
 
-        # Canvas middle area for avatar / video
-        self.canvas = Canvas(root, width=self.width, height=self.height, bg=self.bg_color, highlightthickness=0)
-        self.canvas.pack(fill='both', expand=True)
+        # Create avatar base images
+        self.avatar_pil = make_avatar_image(600)
+        self.avatar_center = ImageTk.PhotoImage(self.avatar_pil.resize((500,500), Image.LANCZOS))
+        self.avatar_small = ImageTk.PhotoImage(self.avatar_pil.resize((140,140), Image.LANCZOS))
 
-        # Load avatar image (placeholder if not exists)
-        here = os.path.dirname(__file__)
-        avatar_path = os.path.join(here, 'person_avatar.png')
-        if not os.path.exists(avatar_path):
-            # create a simple placeholder
-            im = Image.new('RGBA', (600, 600), (240, 240, 250))
-            im = im.filter(ImageFilter.GaussianBlur(radius=0))
-            im.save(avatar_path)
-        self.avatar_orig = Image.open(avatar_path).convert('RGBA')
+        # dynamic ring parameters
+        self.ring_phase = 0.0
+        self.ring_id = None
 
-        # Precompute images for center and small corner
-        self.avatar_center = ImageTk.PhotoImage(self.avatar_orig.resize((600, 600), Image.LANCZOS))
-        self.avatar_corner = ImageTk.PhotoImage(self.avatar_orig.resize((180, 180), Image.LANCZOS))
+        # initial center image
+        self.center_id = self.canvas.create_image(self.w//2, self.h//2 - 70, image=self.avatar_center)
+        # corner small (hidden initially)
+        self.corner_id = self.canvas.create_image(self.w-100, 80, image=self.avatar_small, state="hidden")
+        # status text
+        self.status_id = self.canvas.create_text(self.w//2, self.h//2 + 300, text="Xin chào! Mình là Alex — Trợ lý tiếng Việt.", font=("Arial", 20), fill="#222")
+        self.substatus_id = self.canvas.create_text(self.w//2, self.h//2 + 340, text="Đang lắng nghe...", font=("Arial", 16), fill="#444")
+        # chat log (text widget placed as window)
+        self.chat_text = Text(root, width=70, height=8, font=("Arial", 12))
+        self.chat_text.insert(END, "Hệ thống sẵn sàng...\n")
+        self.chat_text.config(state="disabled")
+        self.chat_win = self.canvas.create_window(self.w//2, self.h-140, window=self.chat_text)
 
-        # initial state: no camera feed -> avatar center
-        self.camera_active = False
-        self.vid_frame = None
-        self.known_faces = load_known_faces()
-
-        # Draw center avatar
-        self.center_image_id = self.canvas.create_image(self.width//2, self.height//2 - 40, image=self.avatar_center)
-
-        # Status text under avatar
-        self.status_text_id = self.canvas.create_text(self.width//2, self.height//2 + 320, text='Đang lắng nghe...', font=('Arial', 18), fill='#333')
-
-        # small tip text red when no mic permission etc
-        self.tip_text_id = self.canvas.create_text(self.width//2, self.height//2 + 360, text='', font=('Arial', 14), fill='red')
-
-        # corner avatar (hidden initially)
-        self.corner_image_id = self.canvas.create_image(self.width-120, 60, image=self.avatar_corner, state='hidden')
-
-        # bottom-right label
-        self.canvas.create_text(self.width-120, self.height-30, text='Trợ lý AI tiếng Việt', font=('Arial', 10), fill='#777')
-
-        # Chat log (invisible by default, can be toggled) - small widget using Text in a window area
-        self.chat_text = Text(root, width=60, height=8, font=('Arial', 12))
-        self.chat_window = self.canvas.create_window(self.width//2, self.height-150, window=self.chat_text)
-        self.chat_text.insert(END, 'Hệ thống sẵn sàng...\n')
-        self.chat_text.config(state='disabled')
-
-        # Start audio worker (simple inline interactive or STT integration later)
-        self.start_audio_worker()
-
-        # Try to start camera if available
+        # camera controls
         self.cap = None
-        self.start_camera_if_available()
+        self.camera_active = False
+        self.vid_photo = None
 
-        # schedule periodic UI update for video frames
-        self.update_ui()
+        # face knowledge
+        self.known_faces = []
+        if FACE_AVAILABLE and np is not None:
+            self.known_faces = load_known_faces()
 
-        # bind Escape to exit fullscreen/quit
-        self.root.bind('<Escape>', lambda e: self.quit())
+        # start audio worker (placeholder for STT integration)
+        # start camera auto if available
+        self.start_camera_auto()
 
-    def start_audio_worker(self):
-        # For now we just ensure assistant listens via console fallback or future STT
-        # This can be replaced with vosk STT thread
-        pass
+        # animation loop
+        self.animate()
 
-    def start_camera_if_available(self):
+        # exit on ESC
+        self.root.bind("<Escape>", lambda e: self.quit())
+
+    def append_chat(self, who, text):
+        self.chat_text.config(state="normal")
+        self.chat_text.insert(END, f"{who}: {text}\n")
+        self.chat_text.see(END)
+        self.chat_text.config(state="disabled")
+
+    def start_camera_auto(self):
         if not CV2_AVAILABLE:
-            print('OpenCV not available -> camera disabled')
+            print("OpenCV not available — camera disabled")
+            self.append_chat("system", "Camera không khả dụng.")
             return
         try:
             cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
             if not cap or not cap.isOpened():
                 cap.release()
-                print('No camera found')
+                self.append_chat("system", "Không tìm thấy camera.")
                 return
-            # camera ok
             self.cap = cap
             self.camera_active = True
-            # move avatar to corner
-            self.canvas.itemconfigure(self.center_image_id, state='hidden')
-            self.canvas.itemconfigure(self.corner_image_id, state='normal')
-            # update status
-            self.canvas.itemconfigure(self.status_text_id, text='Camera hoạt động — Đang lắng nghe...')
+            # switch avatar to corner
+            self.canvas.itemconfigure(self.center_id, state="hidden")
+            self.canvas.itemconfigure(self.corner_id, state="normal")
+            self.canvas.itemconfigure(self.status_id, text="Camera hoạt động")
+            self.append_chat("system", "Camera bật — bắt đầu nhận diện.")
             # start camera thread
             threading.Thread(target=self.camera_loop, daemon=True).start()
         except Exception as e:
-            print('Camera start error:', e)
+            print("Camera start error:", e)
+            self.append_chat("system", f"Camera error: {e}")
 
     def camera_loop(self):
-        # camera read loop: detect faces and update chat log
         while self.cap and self.cap.isOpened():
             ret, frame = self.cap.read()
             if not ret:
-                time.sleep(0.1)
+                time.sleep(0.05)
                 continue
-            # convert to PIL image for display
+            # convert BGR -> RGB
             frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            # central display: scale to fit 70% width
+            max_w = int(self.w * 0.7)
+            max_h = int(self.h * 0.7)
             img = Image.fromarray(frame_rgb)
-            # resize to fit a central area (70% screen width)
-            max_w = int(self.width * 0.7)
-            max_h = int(self.height * 0.7)
             img.thumbnail((max_w, max_h), Image.LANCZOS)
-            self.vid_frame = ImageTk.PhotoImage(img)
-
-            # face recognition on small frame for performance
-            if FACE_AVAILABLE:
+            self.vid_photo = ImageTk.PhotoImage(img)
+            # face recognition on smaller frame for speed
+            if FACE_AVAILABLE and np is not None:
                 small = cv2.resize(frame_rgb, (0,0), fx=0.25, fy=0.25)
                 face_locs = face_recognition.face_locations(small)
                 encs = face_recognition.face_encodings(small, face_locs)
-                known = self.known_faces
                 for enc in encs:
-                    # scale encoding already computed; compare
-                    name = find_matching_face(enc, known)
+                    # enc is for small frame scaling; still works for similarity
+                    name = find_match(enc, self.known_faces) if self.known_faces else None
                     if name:
-                        # known person: greet (on UI thread)
-                        self.root.after(0, self.handle_known_person, name)
+                        # greet once (use UI thread)
+                        self.root.after(0, self.greet_person, name)
                     else:
-                        # new person: ask name on UI thread
-                        self.root.after(0, self.prompt_and_save_person, enc)
+                        # prompt for name once
+                        self.root.after(0, self.prompt_save_person, enc)
             time.sleep(0.03)
 
-    def handle_known_person(self, name):
-        text = f'Chào lại {name}!'
-        self.append_chat('assistant', text)
-        speak(text)
+    def greet_person(self, name):
+        msg = f"Chào lại {name}!"
+        self.append_chat("assistant", msg)
+        speak(msg, block=False)
+        # update status line
+        self.canvas.itemconfigure(self.substatus_id, text=f"Chào mừng bạn trở lại, {name}!")
 
-    def prompt_and_save_person(self, face_encoding):
-        # Ask user for name via dialog - blocking dialog on UI thread
-        name = simpledialog.askstring('Người mới', 'Phát hiện người mới. Nhập tên để lưu:')
-        if name:
-            # face_encoding from small frame; need to upcast to full precision
-            enc = np.array(face_encoding, dtype=np.float64)
+    def prompt_save_person(self, encoding):
+        # ask name via dialog
+        name = simpledialog.askstring("Người mới", "Phát hiện người mới. Mời nhập tên để lưu:")
+        if not name:
+            return
+        try:
+            enc = np.array(encoding, dtype=np.float64)
+            save_new_face(name, enc)
+            self.known_faces = load_known_faces()
+            self.append_chat("system", f"Đã lưu {name}.")
+            speak(f"Rất vui được gặp bạn {name}!", block=False)
+        except Exception as e:
+            messagebox.showerror("Lỗi", f"Không lưu được: {e}")
+
+    def animate(self):
+        # animate ring around center avatar if center visible
+        self.ring_phase += 0.08
+        # remove old ring then draw new (cheap approach)
+        if self.ring_id:
             try:
-                save_new_face(name, enc)
-                self.known_faces = load_known_faces()
-                self.append_chat('assistant', f'Đã lưu thông tin {name}.')
-                speak(f'Rất vui được gặp bạn {name}!')
-            except Exception as e:
-                messagebox.showerror('Lỗi', f'Không lưu được: {e}')
-
-    def append_chat(self, role, text):
-        self.chat_text.config(state='normal')
-        self.chat_text.insert(END, f"{role.capitalize()}: {text}\n")
-        self.chat_text.see(END)
-        self.chat_text.config(state='disabled')
-
-    def update_ui(self):
-        # called in main thread periodically to update video or avatar
-        if self.camera_active and self.vid_frame:
-            # draw central video
-            if hasattr(self, 'video_image_id'):
-                self.canvas.itemconfigure(self.video_image_id, image=self.vid_frame)
+                self.canvas.delete(self.ring_id)
+            except Exception:
+                pass
+        # only draw ring when center avatar visible
+        state = self.canvas.itemcget(self.center_id, "state")
+        if state != "hidden":
+            cx = self.w//2
+            cy = self.h//2 - 70
+            base_r = 320
+            # dynamic radius oscillation
+            r = base_r + 8 * sin(self.ring_phase)
+            # ring coordinates
+            x0 = cx - r; y0 = cy - r; x1 = cx + r; y1 = cy + r
+            # draw translucent ring as image for nicer antialiasing
+            ring_im = Image.new("RGBA", (int(r*2+10), int(r*2+10)), (255,255,255,0))
+            draw = ImageDraw.Draw(ring_im)
+            # gradient-ish ring:
+            for i in range(10):
+                alpha = int(20*(10-i))
+                draw.ellipse((i, i, ring_im.size[0]-i, ring_im.size[1]-i), outline=(100,160,255,alpha))
+            self.ring_tk = ImageTk.PhotoImage(ring_im)
+            self.ring_id = self.canvas.create_image(cx - r -5, cy - r -5, image=self.ring_tk, anchor=NW)
+        # update video image if available
+        if self.camera_active and self.vid_photo:
+            if hasattr(self, "video_id"):
+                self.canvas.itemconfigure(self.video_id, image=self.vid_photo)
             else:
-                self.video_image_id = self.canvas.create_image(self.width//2, self.height//2 - 40, image=self.vid_frame)
-            # ensure corner avatar shown
-            self.canvas.itemconfigure(self.center_image_id, state='hidden')
-            self.canvas.itemconfigure(self.corner_image_id, state='normal')
+                self.video_id = self.canvas.create_image(self.w//2, self.h//2 - 70, image=self.vid_photo)
+            # ensure corner avatar is visible
+            self.canvas.itemconfigure(self.corner_id, state="normal")
         else:
-            # show center avatar
-            self.canvas.itemconfigure(self.center_image_id, state='normal')
-            self.canvas.itemconfigure(self.corner_image_id, state='hidden')
-        # schedule next
-        self.root.after(30, self.update_ui)
+            # ensure center avatar visible
+            self.canvas.itemconfigure(self.center_id, state="normal")
+            # hide video id if exists
+            if hasattr(self, "video_id"):
+                try:
+                    self.canvas.delete(self.video_id)
+                    delattr = False
+                except Exception:
+                    pass
+        # schedule next draw
+        self.root.after(30, self.animate)
 
     def quit(self):
         try:
@@ -299,20 +384,21 @@ class VoiceCameraApp:
                 self.cap.release()
         except Exception:
             pass
-        self.root.destroy()
-
-# ========== main ==========
-def main():
-    root = Tk()
-    app = VoiceCameraApp(root)
-    try:
-        root.mainloop()
-    finally:
         try:
-            if app.cap:
-                app.cap.release()
+            conn.commit()
+            conn.close()
         except Exception:
             pass
+        self.root.destroy()
 
-if __name__ == '__main__':
+# ========== Run ==========
+def main():
+    root = Tk()
+    app = AssistantApp(root)
+    try:
+        root.mainloop()
+    except KeyboardInterrupt:
+        app.quit()
+
+if __name__ == "__main__":
     main()
